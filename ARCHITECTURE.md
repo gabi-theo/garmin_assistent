@@ -1,110 +1,108 @@
 # Architecture
 
+## 1. Component overview
+
 ```mermaid
-flowchart TB
+flowchart LR
     UI["React Frontend"]
 
-    subgraph API["FastAPI (app/main.py)"]
-        AUTH["/auth<br/>register, login, garmin creds, logout"]
-        METRICSAPI["/metrics/{metric}"]
-        INSIGHTSAPI["/insights/latest"]
-        CHATAPI["/chat (SSE)"]
-        WSAPI["/ws/live (WebSocket)"]
-        HEALTHAPI["/health/status, /health/poll"]
+    subgraph APP["FastAPI app<br/>(API + Kafka consumer + LangGraph agent)"]
+        API["REST / SSE / WebSocket"]
     end
 
     subgraph CELERY["Celery"]
-        BEAT["celery_beat<br/>poll_all_users_task<br/>every GARMIN_POLL_INTERVAL"]
-        WORKER["celery_worker<br/>poll_user_task"]
+        BEAT["Beat scheduler"]
+        WORKER["Worker"]
     end
 
-    RUNPOLL["run_poll_cycle()<br/>(app/garmin/poller.py)"]
-    GARMIN["Garmin Connect API"]
-    KAFKA["Kafka topic<br/>garmin.&lt;metric&gt;.&lt;user_id&gt;"]
-    CONSUMER["Kafka consumer loop"]
+    GARMIN[("Garmin Connect")]
+    KAFKA[("Kafka")]
+    REDIS[("Redis")]
+    DB[("TimescaleDB")]
+    OLLAMA[("Ollama LLM")]
 
-    subgraph AGENT["LangGraph Agent"]
-        direction TB
-        N1["ingest_metrics"] --> N2["detect_anomaly"]
-        N2 -->|"anomaly"| N3["retrieve_history"]
-        N2 -->|"no anomaly"| N5["persist_results"]
-        N3 --> N4["generate_insight (Ollama)"]
-        N4 -->|"chat mode"| DONE(("END"))
-        N4 -->|"ingest pipeline"| N5
-    end
+    UI <--> API
+    API <--> REDIS
+    API <--> DB
+    API <--> OLLAMA
+    API -->|"trigger immediate poll"| WORKER
 
-    OLLAMA["Ollama LLM"]
-
-    subgraph REDIS["Redis"]
-        SESS["sessions"]
-        CACHE["metrics:* sorted sets + flush queue"]
-        STATUS["poller_status:*"]
-        LOCK["agent locks"]
-        PUBSUB["live:* pub/sub"]
-    end
-
-    subgraph TSDB["TimescaleDB"]
-        USERS["users"]
-        METRICSTBL["metrics (hypertable)"]
-        INSIGHTSTBL["insights"]
-        SNAPSHOT["profile_snapshots"]
-    end
-
-    FLUSH["Cache flusher (60s)"]
-
-    %% Frontend <-> API
-    UI <--> AUTH
-    UI <--> METRICSAPI
-    UI <--> INSIGHTSAPI
-    UI <--> CHATAPI
-    UI <--> WSAPI
-    UI <--> HEALTHAPI
-
-    %% Auth
-    AUTH --> USERS
-    AUTH --> SESS
-    AUTH -->|"save garmin creds<br/>poll_user_task.delay()"| WORKER
-
-    %% Polling pipeline
-    BEAT -->|"users with creds"| USERS
     BEAT --> WORKER
-    WORKER --> RUNPOLL
-    HEALTHAPI -->|"manual poll (in-process)"| RUNPOLL
-    STATUS --> HEALTHAPI
+    WORKER --> GARMIN
+    WORKER --> KAFKA
+    WORKER --> REDIS
 
-    RUNPOLL -->|"fetch_all_metrics"| GARMIN
-    RUNPOLL --> STATUS
-    RUNPOLL -->|"publish_metric"| KAFKA
+    KAFKA --> API
+```
 
-    %% Ingestion -> Agent
-    KAFKA --> CONSUMER
-    CONSUMER --> LOCK
-    CONSUMER --> CACHE
-    CONSUMER --> N1
+## 2. Background polling & ingestion pipeline
 
-    %% Chat path enters agent directly
-    CHATAPI -->|"chat_mode=true"| N3
+```mermaid
+sequenceDiagram
+    participant Beat as Celery Beat
+    participant Worker as Celery Worker
+    participant Garmin as Garmin Connect API
+    participant Kafka
+    participant Consumer as Kafka Consumer
+    participant Redis
+    participant Agent as LangGraph Agent
+    participant Ollama
+    participant DB as TimescaleDB
+    participant WS as WebSocket client
 
-    %% Agent <-> Ollama
-    N4 <--> OLLAMA
+    Beat->>Worker: poll_user_task (every GARMIN_POLL_INTERVAL)
+    Worker->>Garmin: fetch_all_metrics()
+    Garmin-->>Worker: metrics
+    Worker->>Kafka: publish_metric()
+    Worker->>Redis: update poller_status
 
-    %% Persist + live push
-    N5 --> INSIGHTSTBL
-    N5 --> SNAPSHOT
-    N5 --> PUBSUB
-    N5 --> LOCK
-    PUBSUB --> WSAPI
+    Kafka->>Consumer: telemetry event
+    Consumer->>Redis: acquire lock + cache_metric()
+    Consumer->>Agent: invoke graph
 
-    %% Reads
-    METRICSAPI -->|"<=24h"| CACHE
-    METRICSAPI -->|">24h"| METRICSTBL
-    INSIGHTSAPI --> INSIGHTSTBL
+    Agent->>Redis: detect_anomaly (rolling stats)
+    alt anomaly detected
+        Agent->>Redis: retrieve_history
+        Agent->>Ollama: generate_insight
+        Ollama-->>Agent: insight text
+    end
+    Agent->>DB: persist insight + profile snapshot
+    Agent->>Redis: publish live event
+    Redis-->>WS: push update
 
-    %% Background flush
-    CACHE --> FLUSH --> METRICSTBL
+    Note over Redis,DB: Redis cache is also flushed to<br/>TimescaleDB every 60s by a background task
+```
+
+## 3. User-facing API
+
+```mermaid
+flowchart LR
+    UI["Frontend"]
+
+    UI -->|"REST"| AUTH["/auth"]
+    UI -->|"REST"| METRICS["/metrics/{metric}"]
+    UI -->|"REST"| INSIGHTS["/insights/latest"]
+    UI -->|"SSE"| CHAT["/chat"]
+    UI -->|"WebSocket"| WS["/ws/live"]
+    UI -->|"REST"| HEALTH["/health"]
+
+    AUTH --> DB[("TimescaleDB")]
+    AUTH --> SESS[("Redis: sessions")]
+    AUTH -.->|"save Garmin creds"| WORKER["Celery: poll_user_task"]
+
+    METRICS -->|"<=24h"| CACHE[("Redis: metric cache")]
+    METRICS -->|">24h"| DB
+
+    INSIGHTS --> DB
+
+    CHAT --> AGENT["LangGraph Agent"] --> OLLAMA[("Ollama")]
+
+    WS --> PUBSUB[("Redis: pub/sub")]
+    HEALTH --> WORKER
+    HEALTH --> STATUS[("Redis: poller_status")]
 ```
 
 ## Two main flows
 
-1. **Background ingestion**: Celery Beat ticks every `GARMIN_POLL_INTERVAL` and dispatches `poll_user_task` per user. Each task fetches data from Garmin, publishes it to Kafka, and the consumer caches it in Redis and runs the LangGraph agent (anomaly detection, optional Ollama insight, persistence to TimescaleDB, and a live event over Redis pub/sub to WebSocket clients).
-2. **User-facing API**: the frontend hits `/auth`, `/metrics`, `/insights`, `/chat` (SSE, runs the same LangGraph agent in chat mode against Ollama), and `/ws/live` (subscribes to the per-user pub/sub channel for real-time updates).
+1. **Background ingestion** (diagram 2): Celery Beat ticks every `GARMIN_POLL_INTERVAL` and dispatches `poll_user_task` per user. Each task fetches data from Garmin, publishes it to Kafka, and the consumer caches it in Redis and runs the LangGraph agent (anomaly detection, optional Ollama insight, persistence to TimescaleDB, and a live event over Redis pub/sub to WebSocket clients).
+2. **User-facing API** (diagram 3): the frontend hits `/auth`, `/metrics`, `/insights`, `/chat` (SSE, runs the same LangGraph agent in chat mode against Ollama), and `/ws/live` (subscribes to the per-user pub/sub channel for real-time updates).
